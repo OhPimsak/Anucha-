@@ -1,44 +1,57 @@
 /**
- * ca-store.js — เก็บข้อมูลที่ผู้สอนแก้ไขในระบบ CA ลง localStorage
- * ครอบคลุม: การตั้งค่า (น้ำหนัก/เกณฑ์ผ่าน/สเกลเกรด), รายชื่อ+คะแนนนักศึกษา,
- *           และข้อความสรุปในรายงานรายวิชา (Reflection/CQI/ผลประเมินการสอน)
+ * ca-store.js — เก็บข้อมูลที่ผู้สอนแก้ไขในระบบ CA (หลายรายวิชา) ลง localStorage
  *
+ * โครงสร้างที่เก็บ:
+ *   {
+ *     currentCourseId: "<id>",
+ *     courses: {
+ *       "<courseId>": { setup, students[], report{reflection,cqi,teachingEval} }
+ *     }
+ *   }
  * ข้อมูลทั้งหมดอยู่ในเครื่องผู้ใช้ ไม่มีการส่งออกภายนอก
  */
 (function () {
-  const KEY = "anucha-ca-" + (window.CA_DATA?.CA_COURSE?.code || "course") + "-v1";
-
-  // โคลนข้อมูลตั้งต้นแบบ deep copy เพื่อไม่ให้แก้ค่าใน CA_DATA โดยตรง
+  const KEY = "anucha-ca-multi-v1";
   const clone = (o) => JSON.parse(JSON.stringify(o));
 
   function defaults() {
-    const { CA_SETUP, CA_STUDENTS } = window.CA_DATA;
-    return {
-      setup: {
-        weights: clone(CA_SETUP.weights),
-        pass: clone(CA_SETUP.pass),
-        scaleIndex: CA_SETUP.scaleIndex,
-      },
-      students: clone(CA_STUDENTS),
-      report: { reflection: "", cqi: "", teachingEval: "" },
-    };
+    const { CA_COURSES } = window.CA_DATA;
+    const courses = {};
+    CA_COURSES.forEach((c) => {
+      courses[c.id] = {
+        setup: clone(c.setup),
+        students: clone(c.students),
+        report: { reflection: "", cqi: "", teachingEval: "" },
+      };
+    });
+    return { currentCourseId: CA_COURSES[0].id, courses };
   }
 
   function read() {
+    const d = defaults();
     try {
       const raw = localStorage.getItem(KEY);
-      if (!raw) return defaults();
+      if (!raw) return d;
       const saved = JSON.parse(raw);
-      const d = defaults();
-      // ผสานแบบตื้น ๆ เพื่อรองรับโครงสร้างที่เพิ่มภายหลัง
-      return {
-        setup: Object.assign(d.setup, saved.setup || {}),
-        students: Array.isArray(saved.students) ? saved.students : d.students,
-        report: Object.assign(d.report, saved.report || {}),
-      };
+      // ผสานราย course เพื่อรองรับรายวิชาที่เพิ่มในภายหลัง
+      const courses = {};
+      Object.keys(d.courses).forEach((id) => {
+        const base = d.courses[id];
+        const sv = (saved.courses || {})[id] || {};
+        courses[id] = {
+          setup: Object.assign(clone(base.setup), sv.setup || {}),
+          students: Array.isArray(sv.students) ? sv.students : base.students,
+          report: Object.assign(clone(base.report), sv.report || {}),
+        };
+      });
+      const currentCourseId =
+        saved.currentCourseId && courses[saved.currentCourseId]
+          ? saved.currentCourseId
+          : d.currentCourseId;
+      return { currentCourseId, courses };
     } catch (e) {
       console.warn("อ่านข้อมูล CA ไม่สำเร็จ ใช้ค่าเริ่มต้น", e);
-      return defaults();
+      return d;
     }
   }
 
@@ -53,57 +66,60 @@
   const CAStore = {
     getState: read,
 
-    saveSetup(setup) {
-      const s = read();
-      s.setup = Object.assign(s.setup, setup);
-      write(s);
-      return s;
+    getCourse(courseId) {
+      return read().courses[courseId] || null;
     },
 
-    saveStudents(students) {
+    setCurrentCourse(courseId) {
       const s = read();
-      s.students = students;
-      write(s);
-      return s;
-    },
-
-    /** อัปเดตคะแนน CLO หนึ่งช่องของนักศึกษาคนหนึ่ง (value เป็นเศษส่วน 0–1 หรือ null) */
-    updateScore(studentId, cloId, value) {
-      const s = read();
-      const st = s.students.find((x) => x.id === studentId);
-      if (st) {
-        st.scores = st.scores || {};
-        st.scores[cloId] = value;
+      if (s.courses[courseId]) {
+        s.currentCourseId = courseId;
         write(s);
       }
       return s;
     },
 
-    addStudent(student) {
+    saveSetup(courseId, setup) {
       const s = read();
-      s.students.push(student);
+      s.courses[courseId].setup = Object.assign(s.courses[courseId].setup, setup);
       write(s);
       return s;
     },
 
-    removeStudent(studentId) {
+    saveStudents(courseId, students) {
       const s = read();
-      s.students = s.students.filter((x) => x.id !== studentId);
+      s.courses[courseId].students = students;
       write(s);
       return s;
     },
 
-    saveReport(report) {
+    saveReport(courseId, report) {
       const s = read();
-      s.report = Object.assign(s.report, report);
+      s.courses[courseId].report = Object.assign(s.courses[courseId].report, report);
       write(s);
       return s;
     },
 
-    /** คืนค่าเริ่มต้นทั้งหมด (ลบข้อมูลที่แก้ไข) */
+    /** คืนค่าเริ่มต้นทั้งระบบ (ทุกรายวิชา) */
     reset() {
       localStorage.removeItem(KEY);
       return defaults();
+    },
+
+    /** คืนค่าเริ่มต้นเฉพาะรายวิชาเดียว */
+    resetCourse(courseId) {
+      const s = read();
+      const { CA_COURSES } = window.CA_DATA;
+      const def = CA_COURSES.find((c) => c.id === courseId);
+      if (def) {
+        s.courses[courseId] = {
+          setup: clone(def.setup),
+          students: clone(def.students),
+          report: { reflection: "", cqi: "", teachingEval: "" },
+        };
+        write(s);
+      }
+      return s;
     },
   };
 

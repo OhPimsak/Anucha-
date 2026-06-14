@@ -516,3 +516,38 @@ section { margin-bottom: 44px; }
 @media (max-width: 520px) {
   .ca-coursebar { flex-direction: column; align-items: flex-start; }
 }
+
+/* ===== ระบบ CA — ส่วนเพิ่มเติม (หลายรายวิชา + องค์ประกอบย่อย) ===== */
+.ca-head {
+  display: flex; flex-wrap: wrap; gap: 12px;
+  align-items: center; justify-content: space-between; margin-bottom: 18px;
+}
+.ca-head .ca-subnav { margin-bottom: 0; flex: 1; min-width: 280px; }
+.ca-course-select { display: flex; align-items: center; gap: 8px; }
+.ca-course-select label { font-weight: 600; color: var(--muted); font-size: 14px; }
+.ca-course-select select { min-width: 240px; max-width: 360px; }
+
+.ca-focus {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 14px;
+}
+.ca-focus label { font-weight: 600; font-size: 14px; white-space: nowrap; }
+.ca-focus select { flex: 1; }
+
+/* หัวตารางแบบจัดกลุ่ม */
+.ca-table th.grp {
+  background: #e6f4f1; color: #0f766e; text-align: center;
+}
+.ca-table tr.sub th {
+  background: #f8fafc; font-size: 12.5px; font-weight: 600; top: 38px;
+}
+.ca-table td.derived {
+  background: #f0fdfa; font-weight: 600; color: #0f766e;
+}
+.comp-input {
+  width: 70px; padding: 6px 8px; text-align: right;
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 14px;
+}
+.comp-input:focus { outline: 2px solid var(--ca, #0f766e); outline-offset: -1px; }

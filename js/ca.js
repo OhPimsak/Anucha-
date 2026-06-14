@@ -1,13 +1,14 @@
 /**
- * ca.js — ระบบ CA (Course Assessment) แบบ OBE
+ * ca.js — ระบบ CA (Course Assessment) แบบ OBE รองรับหลายรายวิชา
  * เชื่อม PLO → CLO → Skill ของหลักสูตร เข้ากับการกรอกคะแนนและการตัดเกรดอัตโนมัติ
  *
- * หน้าย่อย (เข้าผ่าน hash routing ของ app.js):
- *   #/ca           ภาพรวมรายวิชา + แผนการสอนราย CLO/สัปดาห์ (CA)
- *   #/ca/criteria  เกณฑ์การบรรลุ CLO และสัดส่วนคะแนน
- *   #/ca/setup     ตั้งค่าน้ำหนัก CLO / เกณฑ์ผ่าน / สเกลเกรด
- *   #/ca/scores    กรอกคะแนนรายบุคคล (คำนวณผล/เกรดอัตโนมัติ)
- *   #/ca/report    รายงานสรุปรายวิชา (CLO attainment, การกระจายเกรด, GPA)
+ * ความสามารถ:
+ *   - เลือกรายวิชาได้หลายวิชา (course selector)
+ *   - กรอกคะแนนระดับ CLO โดยตรง หรือ ระดับองค์ประกอบย่อย (Quiz/ชิ้นงาน/อัตนัย/นำเสนอ)
+ *     ที่ระบบรวมเป็น CLO% ให้อัตโนมัติ (ตาม entryMode ของรายวิชา)
+ *   - นำเข้าคะแนนจากไฟล์ CSV และส่งออกเป็น CSV
+ *
+ * หน้าย่อย (hash routing): #/ca, #/ca/criteria, #/ca/setup, #/ca/scores, #/ca/report
  */
 (function () {
   const D = window.CA_DATA;
@@ -21,28 +22,49 @@
   const nl2br = (s) => esc(s).replace(/\n/g, "<br>");
   const pct = (x, d = 1) => (x == null || isNaN(x) ? "–" : (x * 100).toFixed(d) + "%");
   const round = (x, d = 2) => Math.round(x * Math.pow(10, d)) / Math.pow(10, d);
+  const num = (v) => (v == null || v === "" || isNaN(v) ? null : +v);
+
+  const courseDef = (id) => D.CA_COURSES.find((c) => c.id === id);
 
   // ---------- เครื่องคำนวณผลลัพธ์ (Assessment Engine) ----------
-  function currentScale(setup) {
-    return D.CA_SETUP.scales.find((s) => s.id === setup.scaleIndex) || D.CA_SETUP.scales[0];
+  function scaleById(idx) {
+    return D.CA_GRADE_SCALES.find((s) => s.id === idx) || D.CA_GRADE_SCALES[0];
   }
 
   function gradeFromTotal(total, scale) {
-    for (const [th, g] of scale.bands) {
-      if (total >= th) return g;
-    }
+    for (const [th, g] of scale.bands) if (total >= th) return g;
     return "F";
   }
 
-  /** ประเมินผลของนักศึกษาหนึ่งคน */
-  function evalStudent(st, setup, scale) {
-    const scores = st.scores || {};
+  /** คำนวณ CLO% (เศษส่วน 0–1) จากคะแนนองค์ประกอบย่อย — ต้องกรอกครบทุกองค์ประกอบ */
+  function cloFromComponents(clo, comp) {
+    if (!comp) return null;
+    let acc = 0;
+    let complete = true;
+    clo.components.forEach((m) => {
+      const v = num(comp[m.id]);
+      if (v == null) complete = false;
+      else acc += v * m.weight; // score(0–100) × weight(รวม=100)
+    });
+    return complete && clo.components.length ? acc / 10000 : null;
+  }
+
+  /** คืนคะแนน CLO ของนักศึกษา โดยอิง entryMode ของรายวิชา */
+  function cloScore(def, setup, st, clo) {
+    if (setup.entryMode === "component") return cloFromComponents(clo, st.comp);
+    return num(st.scores ? st.scores[clo.id] : null);
+  }
+
+  /** ประเมินผลของนักศึกษาหนึ่งคนในรายวิชาหนึ่ง */
+  function evalStudent(def, setup, scale, st) {
     const cloPass = {};
+    const cloVal = {};
     let total = 0;
     let hasAll = true;
-    D.CA_CLOS.forEach((c) => {
-      const v = scores[c.id];
-      if (v == null || v === "" || isNaN(v)) {
+    def.clos.forEach((c) => {
+      const v = cloScore(def, setup, st, c);
+      cloVal[c.id] = v;
+      if (v == null) {
         hasAll = false;
         cloPass[c.id] = null;
       } else {
@@ -50,25 +72,22 @@
         total += v * setup.weights[c.id];
       }
     });
-    if (!hasAll) return { cloPass, hasAll: false, overall: "IP", total: null, grade: "IP" };
-    const overall = D.CA_CLOS.every((c) => cloPass[c.id]) ? "PASS" : "FAIL";
-    return { cloPass, hasAll: true, overall, total, grade: gradeFromTotal(total, scale) };
+    if (!hasAll) return { cloPass, cloVal, hasAll: false, overall: "IP", total: null, grade: "IP" };
+    const overall = def.clos.every((c) => cloPass[c.id]) ? "PASS" : "FAIL";
+    return { cloPass, cloVal, hasAll: true, overall, total, grade: gradeFromTotal(total, scale) };
   }
 
-  /** สรุปผลทั้งรายวิชา */
-  function courseReport(state) {
-    const { setup, students } = state;
-    const scale = currentScale(setup);
-    const evals = students.map((st) => ({ st, ev: evalStudent(st, setup, scale) }));
+  function courseReport(def, cs) {
+    const { setup, students } = cs;
+    const scale = scaleById(setup.scaleIndex);
+    const evals = students.map((st) => ({ st, ev: evalStudent(def, setup, scale, st) }));
     const completed = evals.filter((e) => e.ev.hasAll);
     const ip = students.length - completed.length;
     const passCount = completed.filter((e) => e.ev.overall === "PASS").length;
 
     const cloStats = {};
-    D.CA_CLOS.forEach((c) => {
-      const vals = students
-        .map((s) => (s.scores ? s.scores[c.id] : null))
-        .filter((v) => v != null && v !== "" && !isNaN(v));
+    def.clos.forEach((c) => {
+      const vals = evals.map((e) => e.ev.cloVal[c.id]).filter((v) => v != null);
       const sum = vals.reduce((a, b) => a + b, 0);
       const passN = vals.filter((v) => v >= setup.pass[c.id]).length;
       cloStats[c.id] = {
@@ -79,15 +98,14 @@
     });
 
     const avgTotal = completed.length
-      ? completed.reduce((a, e) => a + e.ev.total, 0) / completed.length
-      : 0;
+      ? completed.reduce((a, e) => a + e.ev.total, 0) / completed.length : 0;
 
     const order = ["A", "B+", "B", "C+", "C", "D+", "D", "F"];
     const dist = {};
     order.forEach((g) => (dist[g] = 0));
     completed.forEach((e) => (dist[e.ev.grade] = (dist[e.ev.grade] || 0) + 1));
 
-    const gp = D.CA_SETUP.gradePoints;
+    const gp = D.CA_GRADE_POINTS;
     let pts = 0;
     completed.forEach((e) => (pts += gp[e.ev.grade] || 0));
     const gpa = completed.length ? pts / completed.length : 0;
@@ -99,8 +117,19 @@
     };
   }
 
-  // ---------- แถบเมนูย่อยของระบบ CA ----------
-  function subnav(active) {
+  // ---------- ส่วนหัว: ตัวเลือกรายวิชา + แถบเมนูย่อย ----------
+  function courseSelector(currentId) {
+    const opts = D.CA_COURSES.map(
+      (c) =>
+        `<option value="${esc(c.id)}" ${c.id === currentId ? "selected" : ""}>${esc(c.course.code)} — ${esc(c.course.name)}</option>`
+    ).join("");
+    return `<div class="ca-course-select">
+        <label for="course-select">รายวิชา</label>
+        <select id="course-select" class="cell-input">${opts}</select>
+      </div>`;
+  }
+
+  function subnav(active, currentId) {
     const tabs = [
       ["", "ภาพรวม (CA)"],
       ["criteria", "เกณฑ์การบรรลุ CLO"],
@@ -108,34 +137,32 @@
       ["scores", "กรอกคะแนน"],
       ["report", "รายงานรายวิชา"],
     ];
-    return `<nav class="ca-subnav">${tabs
-      .map(
-        ([k, label]) =>
-          `<a href="#/ca${k ? "/" + k : ""}" data-link class="${active === k ? "active" : ""}">${label}</a>`
-      )
-      .join("")}</nav>`;
+    return `<div class="ca-head">
+      ${courseSelector(currentId)}
+      <nav class="ca-subnav">${tabs
+        .map(([k, label]) => `<a href="#/ca${k ? "/" + k : ""}" data-link class="${active === k ? "active" : ""}">${label}</a>`)
+        .join("")}</nav>
+    </div>`;
   }
 
-  function courseHeader() {
-    const c = D.CA_COURSE;
+  function courseHeader(def, setup) {
+    const c = def.course;
+    const mode = setup.entryMode === "component" ? "กรอกระดับองค์ประกอบย่อย" : "กรอกระดับ CLO";
     return `
       <div class="ca-coursebar">
         <div>
           <span class="badge" style="--accent:#0f766e">${esc(c.code)}</span>
           <strong>${esc(c.name)}</strong>
         </div>
-        <div class="muted">หน่วยกิต ${esc(c.credits)} · ภาคเรียน ${esc(c.semester)} · ${esc(c.instructors.join(", "))}</div>
+        <div class="muted">หน่วยกิต ${esc(c.credits)} · ภาคเรียน ${esc(c.semester)} · ${esc(c.instructors.join(", "))} · <span class="chip">${mode}</span></div>
       </div>`;
   }
 
   // ---------- หน้าภาพรวม (CA) ----------
-  function viewOverview() {
-    const c = D.CA_COURSE;
-    const plos = c.plos
-      .map((p) => `<li><strong>${esc(p.id)}:</strong> ${esc(p.text)}</li>`)
-      .join("");
-
-    const rows = D.CA_WEEKS.map((w) => `
+  function viewOverview(def, cs) {
+    const c = def.course;
+    const plos = c.plos.map((p) => `<li><strong>${esc(p.id)}:</strong> ${esc(p.text)}</li>`).join("");
+    const rows = def.weeks.map((w) => `
       <tr>
         <td class="nowrap">${esc(w.week)}</td>
         <td class="nowrap">${esc(w.plo)}</td>
@@ -151,8 +178,6 @@
       </tr>`).join("");
 
     return `
-      ${subnav("")}
-      ${courseHeader()}
       <section class="ca-grid">
         <div class="card">
           <h3>ข้อมูลรายวิชา</h3>
@@ -175,13 +200,11 @@
         <h3>แผนการจัดการเรียนรู้และการประเมิน (รายสัปดาห์)</h3>
         <div class="table-scroll">
           <table class="ca-table">
-            <thead>
-              <tr>
-                <th>สัปดาห์</th><th>PLO</th><th>CLO</th><th>Skill / ระดับ</th>
-                <th>วิธีประเมิน</th><th>เครื่องมือ</th><th>เกณฑ์การบรรลุ</th><th>ประเภท</th>
-                <th>ทฤษฎี</th><th>ปฏิบัติ/กิจกรรม</th><th>ศึกษาด้วยตนเอง</th>
-              </tr>
-            </thead>
+            <thead><tr>
+              <th>สัปดาห์</th><th>PLO</th><th>CLO</th><th>Skill / ระดับ</th>
+              <th>วิธีประเมิน</th><th>เครื่องมือ</th><th>เกณฑ์การบรรลุ</th><th>ประเภท</th>
+              <th>ทฤษฎี</th><th>ปฏิบัติ/กิจกรรม</th><th>ศึกษาด้วยตนเอง</th>
+            </tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
@@ -189,21 +212,15 @@
   }
 
   // ---------- หน้าเกณฑ์การบรรลุ CLO ----------
-  function viewCriteria() {
-    const blocks = D.CA_CLOS.map((c) => {
+  function viewCriteria(def, cs) {
+    const blocks = def.clos.map((c) => {
       const sumW = c.components.reduce((a, x) => a + (x.weight || 0), 0);
-      const rows = c.components
-        .map((m) => `
-          <tr>
-            <td>${esc(m.method)}</td>
-            <td class="num">${esc(m.weight)}</td>
-            <td>${esc(m.detail)}</td>
-            <td class="num">${esc(m.count)}</td>
-            <td class="num">${esc(m.hours)}</td>
-            <td>${esc(m.tool)}</td>
-            <td>${esc(m.feedback)}</td>
-            <td>${esc(m.when)}</td>
-          </tr>`).join("");
+      const rows = c.components.map((m) => `
+        <tr>
+          <td>${esc(m.method)}</td><td class="num">${esc(m.weight)}</td><td>${esc(m.detail)}</td>
+          <td class="num">${esc(m.count)}</td><td class="num">${esc(m.hours)}</td>
+          <td>${esc(m.tool)}</td><td>${esc(m.feedback)}</td><td>${esc(m.when)}</td>
+        </tr>`).join("");
       return `
         <div class="card ca-clo-card">
           <div class="ca-clo-head">
@@ -225,35 +242,26 @@
           </div>
         </div>`;
     }).join("");
-
-    return `${subnav("criteria")}${courseHeader()}
-      <p class="muted">สัดส่วนคะแนนของแต่ละองค์ประกอบใช้รวมกันเป็นคะแนน CLO (เต็ม 100 ต่อ CLO) ก่อนถ่วงน้ำหนักเป็นคะแนนรวมรายวิชาในหน้า “ตั้งค่า”</p>
-      ${blocks}`;
+    return `<p class="muted">สัดส่วนคะแนนของแต่ละองค์ประกอบรวมกันเป็นคะแนน CLO (เต็ม 100 ต่อ CLO) ก่อนถ่วงน้ำหนักเป็นคะแนนรวมรายวิชา</p>${blocks}`;
   }
 
   // ---------- หน้าตั้งค่า ----------
-  function viewSetup(state) {
-    const s = state.setup;
-    const sumW = D.CA_CLOS.reduce((a, c) => a + (s.weights[c.id] || 0), 0);
-    const wRows = D.CA_CLOS.map((c) => `
+  function viewSetup(def, cs) {
+    const s = cs.setup;
+    const sumW = def.clos.reduce((a, c) => a + (s.weights[c.id] || 0), 0);
+    const wRows = def.clos.map((c) => `
       <tr>
         <td>${esc(c.id)} <span class="muted">(${esc(c.plo)})</span></td>
-        <td><input type="number" class="cell-input" data-kind="weight" data-clo="${c.id}" min="0" max="1" step="0.05" value="${s.weights[c.id]}"></td>
+        <td><input type="number" class="cell-input" data-kind="weights" data-clo="${c.id}" min="0" max="1" step="0.05" value="${s.weights[c.id]}"></td>
         <td><input type="number" class="cell-input" data-kind="pass" data-clo="${c.id}" min="0" max="1" step="0.05" value="${s.pass[c.id]}"></td>
       </tr>`).join("");
+    const scaleOpts = D.CA_GRADE_SCALES.map(
+      (sc) => `<option value="${sc.id}" ${sc.id === s.scaleIndex ? "selected" : ""}>${esc(sc.name)}</option>`).join("");
+    const scale = scaleById(s.scaleIndex);
+    const bandRows = scale.bands.filter(([th]) => th > 0).sort((a, b) => a[0] - b[0])
+      .map(([th, g]) => `<tr><td>≥ ${pct(th, 0)}</td><td><strong>${g}</strong></td></tr>`).join("");
 
-    const scaleOpts = D.CA_SETUP.scales
-      .map((sc) => `<option value="${sc.id}" ${sc.id === s.scaleIndex ? "selected" : ""}>${esc(sc.name)}</option>`)
-      .join("");
-
-    const scale = currentScale(s);
-    const bandRows = scale.bands
-      .filter(([th]) => th > 0)
-      .sort((a, b) => a[0] - b[0])
-      .map(([th, g]) => `<tr><td>≥ ${pct(th, 0)}</td><td><strong>${g}</strong></td></tr>`)
-      .join("");
-
-    return `${subnav("setup")}${courseHeader()}
+    return `
       <section class="ca-grid">
         <div class="card">
           <h3>น้ำหนัก CLO และเกณฑ์ผ่าน</h3>
@@ -263,12 +271,20 @@
             <tfoot><tr><td>รวมน้ำหนัก</td><td id="weight-sum" class="${Math.abs(sumW - 1) < 1e-9 ? "ok" : "warn"}">${round(sumW, 2)}</td><td></td></tr></tfoot>
           </table>
           <div class="form-row">
+            <label>วิธีกรอกคะแนน</label>
+            <select id="mode-select" class="cell-input">
+              <option value="clo" ${s.entryMode === "clo" ? "selected" : ""}>กรอกระดับ CLO (กรอกคะแนน CLO% โดยตรง)</option>
+              <option value="component" ${s.entryMode === "component" ? "selected" : ""}>กรอกระดับองค์ประกอบย่อย (รวมเป็น CLO% อัตโนมัติ)</option>
+            </select>
+          </div>
+          <div class="form-row">
             <label>สเกลการตัดเกรด</label>
             <select id="scale-select" class="cell-input">${scaleOpts}</select>
           </div>
           <div class="ca-actions">
             <button class="btn btn-primary" id="save-setup">บันทึกการตั้งค่า</button>
-            <button class="btn btn-outline" id="reset-ca">คืนค่าเริ่มต้นทั้งระบบ</button>
+            <button class="btn btn-outline" id="reset-course">คืนค่าเริ่มต้นรายวิชานี้</button>
+            <button class="btn btn-outline" id="reset-ca">คืนค่าทั้งระบบ</button>
           </div>
           <p class="muted" id="setup-msg"></p>
         </div>
@@ -284,57 +300,107 @@
   }
 
   // ---------- หน้ากรอกคะแนน ----------
-  function viewScores(state) {
-    const scale = currentScale(state.setup);
-    const head = D.CA_CLOS.map((c) => `<th class="num">${esc(c.id)}%</th>`).join("");
-    const passHead = D.CA_CLOS.map((c) => `<th>${esc(c.id)}</th>`).join("");
+  let _focusClo = null; // CLO ที่เลือกดูองค์ประกอบ (โหมด component)
 
-    const rows = state.students.map((st, idx) => {
-      const ev = evalStudent(st, state.setup, scale);
-      const inputs = D.CA_CLOS.map((c) => {
-        const v = st.scores ? st.scores[c.id] : null;
-        const shown = v == null || v === "" || isNaN(v) ? "" : round(v * 100, 2);
+  function viewScores(def, cs) {
+    const setup = cs.setup;
+    const scale = scaleById(setup.scaleIndex);
+    const component = setup.entryMode === "component";
+
+    if (component && (!_focusClo || !def.clos.some((c) => c.id === _focusClo))) {
+      _focusClo = def.clos[0].id;
+    }
+    const focusClo = component ? def.clos.find((c) => c.id === _focusClo) : null;
+
+    // หัวตาราง
+    let compHead = "";
+    if (component) {
+      compHead = focusClo.components
+        .map((m) => `<th class="num" title="${esc(m.detail)}">${esc(m.method)}<br><span class="muted">(${m.weight}%)</span></th>`)
+        .join("");
+    }
+    const cloHead = def.clos.map((c) => `<th class="num">${esc(c.id)}%</th>`).join("");
+    const passHead = def.clos.map((c) => `<th>${esc(c.id)}</th>`).join("");
+
+    const rows = cs.students.map((st, idx) => {
+      const ev = evalStudent(def, setup, scale, st);
+      let compCells = "";
+      if (component) {
+        compCells = focusClo.components.map((m) => {
+          const v = st.comp ? st.comp[m.id] : null;
+          const shown = v == null || v === "" || isNaN(v) ? "" : round(v, 2);
+          return `<td><input type="number" class="comp-input" data-sid="${esc(st.id)}" data-clo="${focusClo.id}" data-comp="${m.id}" min="0" max="100" step="0.01" value="${shown}" placeholder="–"></td>`;
+        }).join("");
+      }
+      const cloCells = def.clos.map((c) => {
+        const v = ev.cloVal[c.id];
+        if (component) {
+          // โหมดองค์ประกอบ: CLO% เป็นค่าที่คำนวณ (อ่านอย่างเดียว)
+          return `<td class="num derived">${v == null ? "–" : pct(v, 1)}</td>`;
+        }
+        const shown = v == null ? "" : round(v * 100, 2);
         return `<td><input type="number" class="score-input" data-sid="${esc(st.id)}" data-clo="${c.id}" min="0" max="100" step="0.01" value="${shown}" placeholder="–"></td>`;
       }).join("");
-      const passCells = D.CA_CLOS.map((c) => {
+      const passCells = def.clos.map((c) => {
         const p = ev.cloPass[c.id];
         const cls = p == null ? "ip" : p ? "pass" : "fail";
         const txt = p == null ? "–" : p ? "ผ่าน" : "ไม่ผ่าน";
         return `<td><span class="pill ${cls}">${txt}</span></td>`;
       }).join("");
-      const overallCls = ev.overall === "PASS" ? "pass" : ev.overall === "FAIL" ? "fail" : "ip";
+      const oCls = ev.overall === "PASS" ? "pass" : ev.overall === "FAIL" ? "fail" : "ip";
       return `
         <tr>
           <td class="num muted">${idx + 1}</td>
           <td class="nowrap">${esc(st.id)}</td>
           <td>${esc(st.name)}</td>
-          ${inputs}
+          ${compCells}
+          ${cloCells}
           ${passCells}
-          <td><span class="pill ${overallCls}">${ev.overall}</span></td>
+          <td><span class="pill ${oCls}">${ev.overall}</span></td>
           <td class="num">${ev.total == null ? "–" : pct(ev.total, 2)}</td>
           <td class="num"><strong>${ev.grade}</strong></td>
           <td><button class="icon-btn del-student" data-sid="${esc(st.id)}" title="ลบ">✕</button></td>
         </tr>`;
     }).join("");
 
-    return `${subnav("scores")}${courseHeader()}
+    const focusSelector = component
+      ? `<div class="ca-focus">
+          <label>องค์ประกอบของ</label>
+          <select id="focus-clo" class="cell-input">
+            ${def.clos.map((c) => `<option value="${c.id}" ${c.id === _focusClo ? "selected" : ""}>${esc(c.id)} — ${esc(c.text)}</option>`).join("")}
+          </select>
+        </div>` : "";
+
+    const modeNote = component
+      ? `คะแนนองค์ประกอบกรอกเป็นร้อยละ (0–100) · คอลัมน์ <strong>CLO%</strong> คำนวณอัตโนมัติเมื่อกรอกองค์ประกอบของ CLO นั้นครบทุกช่อง`
+      : `กรอกคะแนน CLO เป็นร้อยละ (0–100) · ระบบคำนวณผ่าน คะแนนรวม และเกรดอัตโนมัติ`;
+
+    return `
       <div class="ca-toolbar">
-        <span class="muted">กรอกคะแนน CLO เป็นร้อยละ (0–100) ระบบคำนวณผลผ่าน คะแนนรวม และเกรดอัตโนมัติ · สเกล: <strong>${esc(scale.name)}</strong></span>
+        <span class="muted">${modeNote} · สเกล: <strong>${esc(scale.name)}</strong></span>
         <div class="ca-actions">
+          <button class="btn btn-outline" id="import-csv-btn">นำเข้า CSV</button>
           <button class="btn btn-outline" id="export-csv">ส่งออก CSV</button>
+          <input type="file" id="import-file" accept=".csv,text/csv" style="display:none">
         </div>
       </div>
+      ${focusSelector}
       <div class="table-scroll">
         <table class="ca-table score-table">
-          <thead>
-            <tr>
-              <th>#</th><th>รหัสนักศึกษา</th><th>ชื่อ-สกุล</th>
-              ${head}
-              ${passHead}
-              <th>สรุป</th><th>รวม%</th><th>เกรด</th><th></th>
-            </tr>
-          </thead>
-          <tbody>${rows}</tbody>
+          <thead><tr>
+            <th>#</th><th>รหัสนักศึกษา</th><th>ชื่อ-สกุล</th>
+            ${component ? `<th class="grp" colspan="${focusClo.components.length}">องค์ประกอบของ ${esc(focusClo.id)}</th>` : ""}
+            <th class="grp" colspan="${def.clos.length}">คะแนน CLO</th>
+            <th class="grp" colspan="${def.clos.length}">ผลการบรรลุ</th>
+            <th rowspan="2">สรุป</th><th rowspan="2">รวม%</th><th rowspan="2">เกรด</th><th rowspan="2"></th>
+          </tr>
+          <tr class="sub">
+            <th></th><th></th><th></th>
+            ${compHead}
+            ${cloHead}
+            ${passHead}
+          </tr></thead>
+          <tbody>${rows || `<tr><td colspan="20" class="muted" style="text-align:center;padding:24px">ยังไม่มีนักศึกษา — เพิ่มด้านล่าง หรือ นำเข้า CSV</td></tr>`}</tbody>
         </table>
       </div>
       <div class="card add-student">
@@ -344,33 +410,27 @@
           <input type="text" id="new-name" class="cell-input" placeholder="ชื่อ-สกุล">
           <button class="btn btn-primary" id="add-student">เพิ่ม</button>
         </div>
+        <p class="muted" id="scores-msg"></p>
       </div>`;
   }
 
   // ---------- หน้ารายงานรายวิชา ----------
-  function viewReport(state) {
-    const r = courseReport(state);
-    const scale = currentScale(state.setup);
-
-    const cloRows = D.CA_CLOS.map((c) => {
+  function viewReport(def, cs) {
+    const r = courseReport(def, cs);
+    const scale = scaleById(cs.setup.scaleIndex);
+    const cloRows = def.clos.map((c) => {
       const s = r.cloStats[c.id];
-      return `<tr>
-        <td>${esc(c.id)}</td>
-        <td>${esc(c.text)}</td>
-        <td class="num">${pct(s.avg, 1)}</td>
-        <td class="num">${pct(s.passRate, 0)}</td>
-      </tr>`;
+      return `<tr><td>${esc(c.id)}</td><td>${esc(c.text)}</td>
+        <td class="num">${pct(s.avg, 1)}</td><td class="num">${pct(s.passRate, 0)}</td></tr>`;
     }).join("");
-
     const distRows = r.order.map((g) => {
       const n = r.dist[g] || 0;
       const p = r.completed ? (n / r.completed) * 100 : 0;
       return `<tr><td><strong>${g}</strong></td><td class="num">${n}</td><td class="num">${p.toFixed(1)}%</td>
         <td><span class="bar" style="width:${p}%"></span></td></tr>`;
     }).join("");
-
-    const rep = state.report;
-    return `${subnav("report")}${courseHeader()}
+    const rep = cs.report;
+    return `
       <section class="stat-grid">
         <div class="stat-box"><strong>${r.n}</strong><span>นักศึกษา</span></div>
         <div class="stat-box"><strong>${r.passCount}</strong><span>ผ่านรายวิชา</span></div>
@@ -408,77 +468,125 @@
       </section>`;
   }
 
-  // ---------- การผูกเหตุการณ์หลังเรนเดอร์ ----------
-  function bind(container, sub) {
-    if (sub === "setup") bindSetup(container);
-    else if (sub === "scores") bindScores(container);
-    else if (sub === "report") bindReport(container);
+  // ---------- การผูกเหตุการณ์ ----------
+  function bindCommon(container) {
+    const sel = container.querySelector("#course-select");
+    if (sel) sel.addEventListener("change", () => {
+      Store.setCurrentCourse(sel.value);
+      _focusClo = null;
+      rerender();
+    });
   }
 
-  function bindSetup(container) {
-    const save = container.querySelector("#save-setup");
-    const msg = container.querySelector("#setup-msg");
-    save.addEventListener("click", () => {
-      const setup = Store.getState().setup;
-      container.querySelectorAll('[data-kind]').forEach((inp) => {
+  function bindSetup(container, courseId, def) {
+    container.querySelector("#save-setup").addEventListener("click", () => {
+      const setup = Store.getCourse(courseId).setup;
+      container.querySelectorAll("[data-kind]").forEach((inp) => {
         const v = parseFloat(inp.value);
         if (!isNaN(v)) setup[inp.dataset.kind][inp.dataset.clo] = v;
       });
       setup.scaleIndex = parseInt(container.querySelector("#scale-select").value, 10);
-      const sumW = D.CA_CLOS.reduce((a, c) => a + (setup.weights[c.id] || 0), 0);
-      Store.saveSetup(setup);
-      msg.textContent =
-        Math.abs(sumW - 1) < 1e-9
-          ? "บันทึกเรียบร้อย ✓"
+      setup.entryMode = container.querySelector("#mode-select").value;
+      const sumW = def.clos.reduce((a, c) => a + (setup.weights[c.id] || 0), 0);
+      Store.saveSetup(courseId, setup);
+      container.querySelector("#setup-msg").textContent =
+        Math.abs(sumW - 1) < 1e-9 ? "บันทึกเรียบร้อย ✓"
           : `บันทึกแล้ว — แต่ผลรวมน้ำหนัก = ${round(sumW, 2)} (ควรเท่ากับ 1.00)`;
       rerender();
     });
+    container.querySelector("#reset-course").addEventListener("click", () => {
+      if (confirm("คืนค่าเริ่มต้นเฉพาะรายวิชานี้? คะแนนและการตั้งค่าของรายวิชานี้จะถูกลบ")) {
+        Store.resetCourse(courseId);
+        rerender();
+      }
+    });
     container.querySelector("#reset-ca").addEventListener("click", () => {
-      if (confirm("คืนค่าเริ่มต้นทั้งระบบ CA? คะแนนและการตั้งค่าที่แก้ไขจะถูกลบทั้งหมด")) {
+      if (confirm("คืนค่าเริ่มต้นทั้งระบบ CA? ข้อมูลที่แก้ไขทุกรายวิชาจะถูกลบ")) {
         Store.reset();
         rerender();
       }
     });
   }
 
-  function bindScores(container) {
+  function bindScores(container, courseId, def) {
+    const focus = container.querySelector("#focus-clo");
+    if (focus) focus.addEventListener("change", () => { _focusClo = focus.value; rerender(); });
+
+    // กรอกคะแนน CLO โดยตรง
     container.querySelectorAll(".score-input").forEach((inp) => {
       inp.addEventListener("change", () => {
-        const raw = inp.value.trim();
-        let val = null;
-        if (raw !== "") {
-          const num = parseFloat(raw);
-          if (!isNaN(num)) val = Math.max(0, Math.min(100, num)) / 100;
+        const cs = Store.getCourse(courseId);
+        const st = cs.students.find((x) => x.id === inp.dataset.sid);
+        if (st) {
+          st.scores = st.scores || {};
+          const raw = inp.value.trim();
+          let val = null;
+          if (raw !== "") { const n = parseFloat(raw); if (!isNaN(n)) val = Math.max(0, Math.min(100, n)) / 100; }
+          st.scores[inp.dataset.clo] = val;
+          Store.saveStudents(courseId, cs.students);
         }
-        Store.updateScore(inp.dataset.sid, inp.dataset.clo, val);
         rerender();
       });
     });
+
+    // กรอกคะแนนองค์ประกอบย่อย
+    container.querySelectorAll(".comp-input").forEach((inp) => {
+      inp.addEventListener("change", () => {
+        const cs = Store.getCourse(courseId);
+        const st = cs.students.find((x) => x.id === inp.dataset.sid);
+        if (st) {
+          st.comp = st.comp || {};
+          const raw = inp.value.trim();
+          let val = null;
+          if (raw !== "") { const n = parseFloat(raw); if (!isNaN(n)) val = Math.max(0, Math.min(100, n)); }
+          if (val == null) delete st.comp[inp.dataset.comp];
+          else st.comp[inp.dataset.comp] = val;
+          Store.saveStudents(courseId, cs.students);
+        }
+        rerender();
+      });
+    });
+
     container.querySelectorAll(".del-student").forEach((btn) => {
       btn.addEventListener("click", () => {
         if (confirm("ลบนักศึกษาคนนี้ออกจากรายวิชา?")) {
-          Store.removeStudent(btn.dataset.sid);
+          const cs = Store.getCourse(courseId);
+          Store.saveStudents(courseId, cs.students.filter((x) => x.id !== btn.dataset.sid));
           rerender();
         }
       });
     });
+
     container.querySelector("#add-student").addEventListener("click", () => {
       const sid = container.querySelector("#new-sid").value.trim();
       const name = container.querySelector("#new-name").value.trim();
-      if (!sid || !name) {
-        alert("กรุณากรอกรหัสนักศึกษาและชื่อ-สกุล");
-        return;
-      }
-      Store.addStudent({ id: sid, name, scores: {} });
+      if (!sid || !name) { alert("กรุณากรอกรหัสนักศึกษาและชื่อ-สกุล"); return; }
+      const cs = Store.getCourse(courseId);
+      if (cs.students.some((x) => x.id === sid)) { alert("มีรหัสนักศึกษานี้อยู่แล้ว"); return; }
+      cs.students.push({ id: sid, name, scores: {}, comp: {} });
+      Store.saveStudents(courseId, cs.students);
       rerender();
     });
-    const exp = container.querySelector("#export-csv");
-    if (exp) exp.addEventListener("click", exportCsv);
+
+    const expBtn = container.querySelector("#export-csv");
+    if (expBtn) expBtn.addEventListener("click", () => exportCsv(courseId, def));
+    const impBtn = container.querySelector("#import-csv-btn");
+    const impFile = container.querySelector("#import-file");
+    if (impBtn && impFile) {
+      impBtn.addEventListener("click", () => impFile.click());
+      impFile.addEventListener("change", () => {
+        const f = impFile.files[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = () => importCsv(courseId, def, reader.result, container);
+        reader.readAsText(f, "utf-8");
+      });
+    }
   }
 
-  function bindReport(container) {
+  function bindReport(container, courseId) {
     container.querySelector("#save-report").addEventListener("click", () => {
-      Store.saveReport({
+      Store.saveReport(courseId, {
         reflection: container.querySelector("#rep-reflection").value,
         cqi: container.querySelector("#rep-cqi").value,
         teachingEval: container.querySelector("#rep-eval").value,
@@ -488,65 +596,147 @@
   }
 
   // ---------- ส่งออก CSV ----------
-  function exportCsv() {
-    const state = Store.getState();
-    const scale = currentScale(state.setup);
+  function exportCsv(courseId, def) {
+    const cs = Store.getCourse(courseId);
+    const scale = scaleById(cs.setup.scaleIndex);
     const headers = [
       "Student_ID", "ชื่อ-สกุล",
-      ...D.CA_CLOS.map((c) => c.id + "%"),
-      ...D.CA_CLOS.map((c) => c.id + "_PASS"),
+      ...def.clos.map((c) => c.id + "%"),
+      ...def.clos.map((c) => c.id + "_PASS"),
       "Overall_Status", "Course_Total%", "Grade",
     ];
     const lines = [headers.join(",")];
-    state.students.forEach((st) => {
-      const ev = evalStudent(st, state.setup, scale);
+    cs.students.forEach((st) => {
+      const ev = evalStudent(def, cs.setup, scale, st);
       const cells = [
         st.id, st.name,
-        ...D.CA_CLOS.map((c) => {
-          const v = st.scores ? st.scores[c.id] : null;
-          return v == null || isNaN(v) ? "" : round(v * 100, 2);
-        }),
-        ...D.CA_CLOS.map((c) => (ev.cloPass[c.id] == null ? "" : ev.cloPass[c.id] ? "PASS" : "FAIL")),
+        ...def.clos.map((c) => (ev.cloVal[c.id] == null ? "" : round(ev.cloVal[c.id] * 100, 2))),
+        ...def.clos.map((c) => (ev.cloPass[c.id] == null ? "" : ev.cloPass[c.id] ? "PASS" : "FAIL")),
         ev.overall,
         ev.total == null ? "" : round(ev.total * 100, 2),
         ev.grade,
       ];
       lines.push(cells.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(","));
     });
-    const csv = "﻿" + lines.join("\r\n"); // BOM เพื่อให้ Excel อ่านภาษาไทยได้
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    download(`CA_${def.course.code}_scores.csv`, "﻿" + lines.join("\r\n"));
+  }
+
+  function download(filename, text) {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `CA_${D.CA_COURSE.code}_scores.csv`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
   }
 
-  // ---------- จุดเข้าหลัก ----------
-  let _container = null;
-  let _sub = "";
-
-  function rerender() {
-    render(_container, ["ca", _sub].filter(Boolean));
+  // ---------- นำเข้า CSV ----------
+  /** แปลงข้อความ CSV เป็น array ของ array (รองรับ field มีเครื่องหมายคำพูด/คอมมา/ขึ้นบรรทัด) */
+  function parseCsv(text) {
+    text = text.replace(/^﻿/, "");
+    const rows = [];
+    let row = [], field = "", inQ = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQ = false;
+        } else field += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === ",") { row.push(field); field = ""; }
+      else if (ch === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else if (ch === "\r") { /* ข้าม */ }
+      else field += ch;
+    }
+    if (field !== "" || row.length) { row.push(field); rows.push(row); }
+    return rows.filter((r) => r.some((c) => c.trim() !== ""));
   }
+
+  function importCsv(courseId, def, text, container) {
+    const msg = container.querySelector("#scores-msg");
+    let rows;
+    try { rows = parseCsv(text); } catch (e) { msg.textContent = "อ่านไฟล์ไม่สำเร็จ"; return; }
+    if (!rows.length) { msg.textContent = "ไฟล์ว่างเปล่า"; return; }
+
+    const header = rows[0].map((h) => h.trim().toLowerCase());
+    const idCol = header.findIndex((h) => /student_?id|รหัส/.test(h));
+    const nameCol = header.findIndex((h) => /name|ชื่อ/.test(h));
+    // จับคู่คอลัมน์ CLO เช่น "clo1%" หรือ "clo1"
+    const cloCols = {};
+    def.clos.forEach((c) => {
+      const key = c.id.toLowerCase();
+      const idx = header.findIndex((h) => h.replace(/[%\s]/g, "") === key);
+      if (idx >= 0) cloCols[c.id] = idx;
+    });
+    if (idCol < 0) { msg.textContent = "ไม่พบคอลัมน์รหัสนักศึกษา (Student_ID)"; return; }
+    if (!Object.keys(cloCols).length) { msg.textContent = "ไม่พบคอลัมน์คะแนน CLO (เช่น CLO1%)"; return; }
+
+    const cs = Store.getCourse(courseId);
+    const byId = {};
+    cs.students.forEach((s) => (byId[s.id] = s));
+    let added = 0, updated = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const id = (r[idCol] || "").trim();
+      if (!id) continue;
+      let st = byId[id];
+      if (!st) {
+        st = { id, name: nameCol >= 0 ? (r[nameCol] || "").trim() : id, scores: {}, comp: {} };
+        cs.students.push(st); byId[id] = st; added++;
+      } else {
+        if (nameCol >= 0 && (r[nameCol] || "").trim()) st.name = r[nameCol].trim();
+        updated++;
+      }
+      st.scores = st.scores || {};
+      Object.keys(cloCols).forEach((cloId) => {
+        const raw = (r[cloCols[cloId]] || "").trim();
+        if (raw === "") return;
+        const n = parseFloat(raw.replace("%", ""));
+        if (!isNaN(n)) st.scores[cloId] = Math.max(0, Math.min(100, n)) / 100;
+      });
+    }
+    // นำเข้าเป็นคะแนน CLO โดยตรง — สลับรายวิชาเป็นโหมด CLO เพื่อให้คะแนนที่นำเข้าถูกใช้คำนวณ
+    if (cs.setup.entryMode !== "clo") {
+      cs.setup.entryMode = "clo";
+      Store.saveSetup(courseId, cs.setup);
+    }
+    Store.saveStudents(courseId, cs.students);
+    msg.textContent = `นำเข้าสำเร็จ ✓ เพิ่มใหม่ ${added} คน ปรับปรุง ${updated} คน` +
+      (cs.setup.entryMode === "clo" ? "" : "");
+    rerender();
+  }
+
+  // ---------- จุดเข้าหลัก ----------
+  let _container = null, _sub = "";
+
+  function rerender() { render(_container, ["ca", _sub].filter(Boolean)); }
 
   function render(container, parts) {
     _container = container;
     const sub = parts[1] || "";
     _sub = sub;
     const state = Store.getState();
-    let html;
+    const courseId = state.currentCourseId;
+    const def = courseDef(courseId);
+    const cs = state.courses[courseId];
+
+    let body;
     switch (sub) {
-      case "criteria": html = viewCriteria(); break;
-      case "setup": html = viewSetup(state); break;
-      case "scores": html = viewScores(state); break;
-      case "report": html = viewReport(state); break;
-      default: html = viewOverview(); break;
+      case "criteria": body = viewCriteria(def, cs); break;
+      case "setup": body = viewSetup(def, cs); break;
+      case "scores": body = viewScores(def, cs); break;
+      case "report": body = viewReport(def, cs); break;
+      default: body = viewOverview(def, cs); break;
     }
-    container.innerHTML = `<div class="ca-module">${html}</div>`;
+    container.innerHTML = `<div class="ca-module">${subnav(sub, courseId)}${courseHeader(def, cs.setup)}${body}</div>`;
     window.scrollTo(0, 0);
-    bind(container, sub);
+
+    bindCommon(container);
+    if (sub === "setup") bindSetup(container, courseId, def);
+    else if (sub === "scores") bindScores(container, courseId, def);
+    else if (sub === "report") bindReport(container, courseId);
   }
 
   window.CA = { render };
