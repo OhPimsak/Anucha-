@@ -366,6 +366,13 @@
     const parts = parseRoute();
     let html;
 
+    // ระบบ CA แยกเป็นโมดูลของตัวเอง — มอบหมายให้ window.CA จัดการการเรนเดอร์ทั้งหมด
+    if (parts[0] === "ca" && window.CA) {
+      updateActiveNav("ca");
+      window.CA.render(app, parts);
+      return;
+    }
+
     if (parts.length === 0) {
       html = viewHome();
     } else if (parts[0] === "courses") {
@@ -390,7 +397,7 @@
   }
 
   function updateActiveNav(section) {
-    const map = { "": "#/", courses: "#/courses", about: "#/about", progress: "#/progress" };
+    const map = { "": "#/", courses: "#/courses", ca: "#/ca", about: "#/about", progress: "#/progress" };
     document.querySelectorAll(".main-nav a").forEach((a) => {
       const href = a.getAttribute("href");
       a.classList.toggle("active", href === (map[section] || "#/"));
