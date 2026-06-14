@@ -14,44 +14,48 @@
   const KEY = "anucha-ca-multi-v1";
   const clone = (o) => JSON.parse(JSON.stringify(o));
 
-  function defaults() {
-    const { CA_COURSES } = window.CA_DATA;
+  const baseReport = () => ({ reflection: "", cqi: "", teachingEval: "" });
+
+  /** สร้าง state ราย course จากรายการนิยามรายวิชา (seed + custom) ผสานกับที่บันทึกไว้ */
+  function buildCourseStates(defs, savedCourses) {
     const courses = {};
-    CA_COURSES.forEach((c) => {
-      courses[c.id] = {
-        setup: clone(c.setup),
-        students: clone(c.students),
-        report: { reflection: "", cqi: "", teachingEval: "" },
+    defs.forEach((def) => {
+      const sv = (savedCourses || {})[def.id] || {};
+      courses[def.id] = {
+        setup: Object.assign(clone(def.setup), sv.setup || {}),
+        students: Array.isArray(sv.students) ? sv.students : clone(def.students || []),
+        report: Object.assign(baseReport(), sv.report || {}),
       };
     });
-    return { currentCourseId: CA_COURSES[0].id, courses };
+    return courses;
+  }
+
+  function defaults() {
+    const { CA_COURSES } = window.CA_DATA;
+    return {
+      currentCourseId: CA_COURSES[0].id,
+      customCourses: [],
+      courses: buildCourseStates(CA_COURSES, null),
+    };
   }
 
   function read() {
-    const d = defaults();
+    const { CA_COURSES } = window.CA_DATA;
     try {
       const raw = localStorage.getItem(KEY);
-      if (!raw) return d;
+      if (!raw) return defaults();
       const saved = JSON.parse(raw);
-      // ผสานราย course เพื่อรองรับรายวิชาที่เพิ่มในภายหลัง
-      const courses = {};
-      Object.keys(d.courses).forEach((id) => {
-        const base = d.courses[id];
-        const sv = (saved.courses || {})[id] || {};
-        courses[id] = {
-          setup: Object.assign(clone(base.setup), sv.setup || {}),
-          students: Array.isArray(sv.students) ? sv.students : base.students,
-          report: Object.assign(clone(base.report), sv.report || {}),
-        };
-      });
+      const customCourses = Array.isArray(saved.customCourses) ? saved.customCourses : [];
+      const defs = CA_COURSES.concat(customCourses);
+      const courses = buildCourseStates(defs, saved.courses);
       const currentCourseId =
         saved.currentCourseId && courses[saved.currentCourseId]
           ? saved.currentCourseId
-          : d.currentCourseId;
-      return { currentCourseId, courses };
+          : CA_COURSES[0].id;
+      return { currentCourseId, customCourses, courses };
     } catch (e) {
       console.warn("อ่านข้อมูล CA ไม่สำเร็จ ใช้ค่าเริ่มต้น", e);
-      return d;
+      return defaults();
     }
   }
 
@@ -98,6 +102,39 @@
       s.courses[courseId].report = Object.assign(s.courses[courseId].report, report);
       write(s);
       return s;
+    },
+
+    /** เพิ่มรายวิชาที่ผู้ใช้สร้างเอง (เก็บนิยามไว้ใน customCourses) */
+    addCourse(def) {
+      const s = read();
+      s.customCourses.push(def);
+      s.courses[def.id] = {
+        setup: clone(def.setup),
+        students: clone(def.students || []),
+        report: baseReport(),
+      };
+      s.currentCourseId = def.id;
+      write(s);
+      return s;
+    },
+
+    /** ลบรายวิชาที่ผู้ใช้สร้างเอง (ลบ seed ไม่ได้) */
+    removeCourse(courseId) {
+      const s = read();
+      const isCustom = s.customCourses.some((c) => c.id === courseId);
+      if (!isCustom) return s; // กันการลบรายวิชาตั้งต้น
+      s.customCourses = s.customCourses.filter((c) => c.id !== courseId);
+      delete s.courses[courseId];
+      if (s.currentCourseId === courseId) s.currentCourseId = window.CA_DATA.CA_COURSES[0].id;
+      write(s);
+      return s;
+    },
+
+    /** ตรวจว่ารหัสรายวิชาซ้ำหรือไม่ (ทั้ง seed และ custom) */
+    courseExists(courseId) {
+      const { CA_COURSES } = window.CA_DATA;
+      const s = read();
+      return CA_COURSES.some((c) => c.id === courseId) || s.customCourses.some((c) => c.id === courseId);
     },
 
     /** คืนค่าเริ่มต้นทั้งระบบ (ทุกรายวิชา) */

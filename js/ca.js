@@ -24,7 +24,10 @@
   const round = (x, d = 2) => Math.round(x * Math.pow(10, d)) / Math.pow(10, d);
   const num = (v) => (v == null || v === "" || isNaN(v) ? null : +v);
 
-  const courseDef = (id) => D.CA_COURSES.find((c) => c.id === id);
+  /** รายวิชาทั้งหมดที่ใช้งานได้ = รายวิชาตั้งต้น (seed) + รายวิชาที่ผู้ใช้สร้างเอง */
+  const allDefs = () => D.CA_COURSES.concat(Store.getState().customCourses || []);
+  const courseDef = (id) => allDefs().find((c) => c.id === id);
+  const isCustom = (id) => (Store.getState().customCourses || []).some((c) => c.id === id);
 
   // ---------- เครื่องคำนวณผลลัพธ์ (Assessment Engine) ----------
   function scaleById(idx) {
@@ -119,13 +122,16 @@
 
   // ---------- ส่วนหัว: ตัวเลือกรายวิชา + แถบเมนูย่อย ----------
   function courseSelector(currentId) {
-    const opts = D.CA_COURSES.map(
-      (c) =>
-        `<option value="${esc(c.id)}" ${c.id === currentId ? "selected" : ""}>${esc(c.course.code)} — ${esc(c.course.name)}</option>`
-    ).join("");
+    const opts = allDefs()
+      .map(
+        (c) =>
+          `<option value="${esc(c.id)}" ${c.id === currentId ? "selected" : ""}>${esc(c.course.code)} — ${esc(c.course.name)}</option>`
+      )
+      .join("");
     return `<div class="ca-course-select">
         <label for="course-select">รายวิชา</label>
         <select id="course-select" class="cell-input">${opts}</select>
+        <a class="btn btn-outline btn-sm" href="#/ca/new" data-link>+ เพิ่มรายวิชา</a>
       </div>`;
   }
 
@@ -284,7 +290,9 @@
           <div class="ca-actions">
             <button class="btn btn-primary" id="save-setup">บันทึกการตั้งค่า</button>
             <button class="btn btn-outline" id="reset-course">คืนค่าเริ่มต้นรายวิชานี้</button>
-            <button class="btn btn-outline" id="reset-ca">คืนค่าทั้งระบบ</button>
+            ${isCustom(def.id)
+              ? `<button class="btn btn-outline btn-danger" id="delete-course">ลบรายวิชานี้</button>`
+              : `<button class="btn btn-outline" id="reset-ca">คืนค่าทั้งระบบ</button>`}
           </div>
           <p class="muted" id="setup-msg"></p>
         </div>
@@ -468,13 +476,219 @@
       </section>`;
   }
 
+  // ---------- หน้าเพิ่มรายวิชา (Course Builder) ----------
+  let _draft = null;
+
+  function defaultDraft() {
+    const seed = D.CA_COURSES[0].course;
+    return {
+      code: "", name: "", credits: "3(2-2-5)", semester: "1/2568",
+      group: "กลุ่มวิชาเลือก", year: "ชั้นปีที่ 1",
+      instructors: "ผศ.อนุชา พิมศักดิ์", owner: "ผศ.อนุชา พิมศักดิ์",
+      faculty: seed.faculty, program: seed.program, description: "",
+      scaleIndex: 1, entryMode: "component",
+      clos: [{ text: "", plo: "PLO1", pass: 70, weight: 1, components: [{ method: "", weight: 100 }] }],
+    };
+  }
+
+  /** อ่านค่าจากฟอร์มกลับเข้า _draft (ก่อนเรนเดอร์ใหม่หรือบันทึก) */
+  function syncDraft(container) {
+    const g = (id) => { const el = container.querySelector("#" + id); return el ? el.value : ""; };
+    _draft.code = g("nc-code").trim();
+    _draft.name = g("nc-name").trim();
+    _draft.credits = g("nc-credits").trim();
+    _draft.semester = g("nc-semester").trim();
+    _draft.group = g("nc-group").trim();
+    _draft.year = g("nc-year").trim();
+    _draft.instructors = g("nc-instructors").trim();
+    _draft.owner = g("nc-owner").trim();
+    _draft.faculty = g("nc-faculty").trim();
+    _draft.program = g("nc-program").trim();
+    _draft.description = g("nc-desc").trim();
+    _draft.scaleIndex = parseInt(g("nc-scale"), 10) || 1;
+    _draft.entryMode = g("nc-mode") || "component";
+    _draft.clos = [...container.querySelectorAll(".clo-block")].map((blk) => {
+      const q = (sel) => blk.querySelector(sel);
+      return {
+        text: q(".nc-clo-text").value.trim(),
+        plo: q(".nc-clo-plo").value.trim() || "PLO1",
+        pass: parseFloat(q(".nc-clo-pass").value) || 0,
+        weight: parseFloat(q(".nc-clo-weight").value) || 0,
+        components: [...blk.querySelectorAll(".comp-row")].map((row) => ({
+          method: row.querySelector(".nc-comp-method").value.trim(),
+          weight: parseFloat(row.querySelector(".nc-comp-weight").value) || 0,
+        })),
+      };
+    });
+  }
+
+  function viewNewCourse() {
+    if (!_draft) _draft = defaultDraft();
+    const d = _draft;
+    const scaleOpts = D.CA_GRADE_SCALES.map(
+      (s) => `<option value="${s.id}" ${s.id === d.scaleIndex ? "selected" : ""}>${esc(s.name)}</option>`).join("");
+
+    const cloBlocks = d.clos.map((c, ci) => {
+      const sumW = c.components.reduce((a, x) => a + (x.weight || 0), 0);
+      const compRows = c.components.map((m, cj) => `
+        <div class="comp-row" data-cj="${cj}">
+          <input type="text" class="cell-input nc-comp-method" placeholder="วิธีการประเมิน เช่น ทดสอบย่อย/ชิ้นงาน/อัตนัย/นำเสนอ" value="${esc(m.method)}">
+          <input type="number" class="cell-input nc-comp-weight" min="0" max="100" step="1" placeholder="น้ำหนัก%" value="${m.weight}">
+          <button class="icon-btn nc-del-comp" data-ci="${ci}" data-cj="${cj}" title="ลบองค์ประกอบ">✕</button>
+        </div>`).join("");
+      return `
+        <div class="clo-block" data-ci="${ci}">
+          <div class="clo-block-head">
+            <span class="badge" style="--accent:#0f766e">CLO${ci + 1}</span>
+            <button class="icon-btn nc-del-clo" data-ci="${ci}" title="ลบ CLO">✕</button>
+          </div>
+          <div class="form-grid">
+            <label class="wide">ข้อความ CLO
+              <input type="text" class="cell-input nc-clo-text" placeholder="ผลลัพธ์การเรียนรู้ของรายวิชา" value="${esc(c.text)}"></label>
+            <label>PLO ที่รองรับ
+              <input type="text" class="cell-input nc-clo-plo" placeholder="PLO1" value="${esc(c.plo)}"></label>
+            <label>เกณฑ์ผ่าน (%)
+              <input type="number" class="cell-input nc-clo-pass" min="0" max="100" step="1" value="${c.pass}"></label>
+            <label>น้ำหนัก CLO (สัดส่วน)
+              <input type="number" class="cell-input nc-clo-weight" min="0" max="1" step="0.05" value="${c.weight}"></label>
+          </div>
+          <div class="comp-builder">
+            <div class="comp-builder-head"><span>องค์ประกอบการประเมิน (น้ำหนักรวม = 100)</span>
+              <span class="${Math.abs(sumW - 100) < 0.5 ? "ok" : "warn"}">รวม ${round(sumW, 1)}</span></div>
+            ${compRows}
+            <button class="btn btn-outline btn-sm nc-add-comp" data-ci="${ci}">+ เพิ่มองค์ประกอบ</button>
+          </div>
+        </div>`;
+    }).join("");
+
+    return `
+      <section class="card">
+        <h2 style="margin-top:0">เพิ่มรายวิชาใหม่</h2>
+        <p class="muted">กรอกข้อมูลรายวิชาและกำหนด CLO พร้อมองค์ประกอบการประเมิน — รายวิชาที่เพิ่มจะถูกบันทึกในเครื่องของคุณ</p>
+        <div class="form-grid">
+          <label>รหัสวิชา *<input type="text" id="nc-code" class="cell-input" placeholder="เช่น ED-002-908" value="${esc(d.code)}"></label>
+          <label class="wide">ชื่อวิชา *<input type="text" id="nc-name" class="cell-input" placeholder="ชื่อรายวิชา" value="${esc(d.name)}"></label>
+          <label>หน่วยกิต<input type="text" id="nc-credits" class="cell-input" value="${esc(d.credits)}"></label>
+          <label>ภาคเรียน<input type="text" id="nc-semester" class="cell-input" value="${esc(d.semester)}"></label>
+          <label>กลุ่มวิชา<input type="text" id="nc-group" class="cell-input" value="${esc(d.group)}"></label>
+          <label>ชั้นปี<input type="text" id="nc-year" class="cell-input" value="${esc(d.year)}"></label>
+          <label>ผู้สอน (คั่นด้วย ,)<input type="text" id="nc-instructors" class="cell-input" value="${esc(d.instructors)}"></label>
+          <label>ผู้รับผิดชอบรายวิชา<input type="text" id="nc-owner" class="cell-input" value="${esc(d.owner)}"></label>
+          <label class="wide">คณะ<input type="text" id="nc-faculty" class="cell-input" value="${esc(d.faculty)}"></label>
+          <label class="wide">หลักสูตร<input type="text" id="nc-program" class="cell-input" value="${esc(d.program)}"></label>
+          <label class="wide">คำอธิบายรายวิชา<textarea id="nc-desc" rows="2" class="cell-input">${esc(d.description)}</textarea></label>
+          <label>วิธีกรอกคะแนน
+            <select id="nc-mode" class="cell-input">
+              <option value="clo" ${d.entryMode === "clo" ? "selected" : ""}>ระดับ CLO</option>
+              <option value="component" ${d.entryMode === "component" ? "selected" : ""}>ระดับองค์ประกอบย่อย</option>
+            </select></label>
+          <label>สเกลการตัดเกรด<select id="nc-scale" class="cell-input">${scaleOpts}</select></label>
+        </div>
+
+        <h3>ผลลัพธ์การเรียนรู้รายวิชา (CLO)</h3>
+        ${cloBlocks}
+        <button class="btn btn-outline nc-add-clo">+ เพิ่ม CLO</button>
+
+        <div class="ca-actions" style="margin-top:20px">
+          <button class="btn btn-primary" id="nc-save">บันทึกรายวิชา</button>
+          <a class="btn btn-outline" href="#/ca" data-link>ยกเลิก</a>
+          <span class="muted" id="nc-msg"></span>
+        </div>
+      </section>`;
+  }
+
+  function buildCourseDef(d) {
+    // ปรับน้ำหนัก CLO ให้รวมเป็น 1 อัตโนมัติ
+    const wsum = d.clos.reduce((a, c) => a + (c.weight || 0), 0);
+    const weights = {}, pass = {};
+    const clos = d.clos.map((c, i) => {
+      const id = "CLO" + (i + 1);
+      weights[id] = wsum > 0 ? round((c.weight || 0) / wsum, 4) : round(1 / d.clos.length, 4);
+      pass[id] = round((c.pass || 0) / 100, 4);
+      return {
+        id, plo: c.plo, text: c.text, pass: c.pass, weight: weights[id],
+        components: c.components.map((m, j) => ({
+          id: `${id}-${j}`, method: m.method, weight: m.weight,
+          detail: "", count: 1, hours: 1, tool: "", feedback: "", when: "",
+        })),
+      };
+    });
+    const ploIds = [...new Set(d.clos.map((c) => c.plo))];
+    const plos = ploIds.map((id) => ({ id, text: "" }));
+    return {
+      id: d.code,
+      course: {
+        faculty: d.faculty, program: d.program, group: d.group, code: d.code, name: d.name,
+        credits: d.credits, year: d.year, semester: d.semester,
+        instructors: d.instructors.split(",").map((s) => s.trim()).filter(Boolean),
+        owner: d.owner, description: d.description, ploSupport: "D (Developing)", plos,
+      },
+      clos, weeks: [],
+      setup: { weights, pass, scaleIndex: d.scaleIndex, entryMode: d.entryMode },
+      students: [],
+    };
+  }
+
+  function bindNewCourse(container) {
+    const msg = container.querySelector("#nc-msg");
+
+    container.querySelector(".nc-add-clo").addEventListener("click", () => {
+      syncDraft(container);
+      _draft.clos.push({ text: "", plo: "PLO1", pass: 70, weight: 0.5, components: [{ method: "", weight: 100 }] });
+      rerender();
+    });
+    container.querySelectorAll(".nc-del-clo").forEach((b) => b.addEventListener("click", () => {
+      syncDraft(container);
+      if (_draft.clos.length <= 1) { alert("ต้องมีอย่างน้อย 1 CLO"); return; }
+      _draft.clos.splice(+b.dataset.ci, 1);
+      rerender();
+    }));
+    container.querySelectorAll(".nc-add-comp").forEach((b) => b.addEventListener("click", () => {
+      syncDraft(container);
+      _draft.clos[+b.dataset.ci].components.push({ method: "", weight: 0 });
+      rerender();
+    }));
+    container.querySelectorAll(".nc-del-comp").forEach((b) => b.addEventListener("click", () => {
+      syncDraft(container);
+      const c = _draft.clos[+b.dataset.ci];
+      if (c.components.length <= 1) { alert("แต่ละ CLO ต้องมีอย่างน้อย 1 องค์ประกอบ"); return; }
+      c.components.splice(+b.dataset.cj, 1);
+      rerender();
+    }));
+
+    container.querySelector("#nc-save").addEventListener("click", () => {
+      syncDraft(container);
+      const d = _draft;
+      if (!d.code) { msg.textContent = "กรุณากรอกรหัสวิชา"; return; }
+      if (Store.courseExists(d.code)) { msg.textContent = "มีรหัสวิชานี้อยู่แล้ว กรุณาใช้รหัสอื่น"; return; }
+      if (!d.name) { msg.textContent = "กรุณากรอกชื่อวิชา"; return; }
+      for (let i = 0; i < d.clos.length; i++) {
+        const c = d.clos[i];
+        if (!c.text) { msg.textContent = `กรุณากรอกข้อความ CLO${i + 1}`; return; }
+        if (!c.components.length || c.components.some((m) => !m.method)) {
+          msg.textContent = `กรุณากรอกวิธีการประเมินให้ครบใน CLO${i + 1}`; return;
+        }
+        const sumW = c.components.reduce((a, m) => a + (m.weight || 0), 0);
+        if (Math.abs(sumW - 100) > 0.5) {
+          msg.textContent = `น้ำหนักองค์ประกอบของ CLO${i + 1} รวมได้ ${round(sumW, 1)} (ต้องเท่ากับ 100)`; return;
+        }
+      }
+      const def = buildCourseDef(d);
+      Store.addCourse(def);
+      _draft = null;
+      location.hash = "#/ca/scores";
+      rerender();
+    });
+  }
+
   // ---------- การผูกเหตุการณ์ ----------
   function bindCommon(container) {
     const sel = container.querySelector("#course-select");
     if (sel) sel.addEventListener("change", () => {
       Store.setCurrentCourse(sel.value);
       _focusClo = null;
-      rerender();
+      if (_sub === "new") location.hash = "#/ca";
+      else rerender();
     });
   }
 
@@ -500,9 +714,18 @@
         rerender();
       }
     });
-    container.querySelector("#reset-ca").addEventListener("click", () => {
+    const resetCa = container.querySelector("#reset-ca");
+    if (resetCa) resetCa.addEventListener("click", () => {
       if (confirm("คืนค่าเริ่มต้นทั้งระบบ CA? ข้อมูลที่แก้ไขทุกรายวิชาจะถูกลบ")) {
         Store.reset();
+        rerender();
+      }
+    });
+    const del = container.querySelector("#delete-course");
+    if (del) del.addEventListener("click", () => {
+      if (confirm("ลบรายวิชานี้ออกจากระบบ? ข้อมูลคะแนนและการตั้งค่าของรายวิชานี้จะถูกลบทั้งหมด")) {
+        Store.removeCourse(courseId);
+        location.hash = "#/ca";
         rerender();
       }
     });
@@ -721,6 +944,14 @@
     const courseId = state.currentCourseId;
     const def = courseDef(courseId);
     const cs = state.courses[courseId];
+
+    if (sub === "new") {
+      container.innerHTML = `<div class="ca-module">${subnav(sub, courseId)}${viewNewCourse()}</div>`;
+      window.scrollTo(0, 0);
+      bindCommon(container);
+      bindNewCourse(container);
+      return;
+    }
 
     let body;
     switch (sub) {
